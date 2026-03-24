@@ -1,176 +1,123 @@
-# ...existing code...
+import time
+import socket
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import numpy as np
-import re
-
-class YouTubeClient:
-    """Simple wrapper around youtube-data API using google-api-python-client."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.youtube = build('youtube', 'v3', developerKey=api_key)
-
-    def get_channel(self, channel_id):
-        return self.youtube.channels().list(
-            part='snippet,statistics,contentDetails',
-            id=channel_id
-        ).execute()
-
-    def search_channels(self, query, max_results=10):
-        return self.youtube.search().list(
-            part='snippet',
-            type='channel',
-            q=query,
-            maxResults=max_results
-        ).execute()
-
-    def get_playlist_items(self, playlist_id, max_results=50):
-        return self.youtube.playlistItems().list(
-            part='snippet,contentDetails',
-            playlistId=playlist_id,
-            maxResults=min(max_results, 50)
-        ).execute()
-
-    def get_videos(self, video_ids):
-        return self.youtube.videos().list(
-            part='snippet,statistics',
-            id=','.join(video_ids)
-        ).execute()
-
 
 class CompetitorDiscovery:
-    def __init__(self, channel_id=None, api_key=None, youtube_client=None):
+    def __init__(self, channel_id, api_key):
         self.channel_id = channel_id
-        if youtube_client is not None:
-            self.youtube = youtube_client.youtube
-        else:
-            self.youtube = build('youtube', 'v3', developerKey=api_key)
+        self.youtube = build('youtube', 'v3', developerKey=api_key)
 
-    def get_channel_id_by_name(self, channel_name):
-        """Resolve a channel name to a channel ID using YouTube search."""
-        if not channel_name:
-            return None
+    def _retry_execute(self, request, retries=3, delay=2):
+        """Helper to retry API calls on connection/DNS issues"""
+        for i in range(retries):
+            try:
+                return request.execute()
+            except (socket.timeout, ConnectionError, socket.error, socket.gaierror) as e:
+                if i == retries - 1:
+                    raise e
+                time.sleep(delay * (i + 1))
+            except HttpError as e:
+                if e.resp.status == 404:
+                    return None
+                raise e
+        return None
 
-        response = self.youtube.search().list(
-            part='snippet',
-            type='channel',
-            q=channel_name,
-            maxResults=3
-        ).execute()
+    def discover(self, category_input, max_candidates=25):
+        """Finds competitors based on category (string or list)"""
+        # Step 1: Search channels by category to get a pool of candidates
+        search_query = category_input
+        if isinstance(category_input, list):
+            search_query = " | ".join(category_input) # OR search for multiple categories
 
-        items = response.get('items', [])
-        if not items:
-            return None
+        # YouTube API limit for maxResults is 50
+        limit = min(50, max_candidates)
 
-        # Use top-ranked result as the best approximate match
-        return items[0]['snippet'].get('channelId')
-
-    def extract_keywords(self, channel_data, videos_data):
-        """Extract relevant keywords from channel description and video titles for competitor search."""
-        keywords = set()
-        
-        # From channel description
-        description = channel_data.get('snippet', {}).get('description', '').lower()
-        # Remove common words and extract meaningful terms
-        words = re.findall(r'\b\w+\b', description)
-        stop_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'an', 'a', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their'}
-        keywords.update([word for word in words if len(word) > 3 and word not in stop_words])
-        
-        # From video titles
-        for video in videos_data[:10]:  # Use first 10 videos
-            title = video.get('title', '').lower()
-            title_words = re.findall(r'\b\w+\b', title)
-            keywords.update([word for word in title_words if len(word) > 3 and word not in stop_words])
-        
-        # Return top keywords (limit to 5-7 for search)
-        return list(keywords)[:7]
-
-    def discover(self, max_competitors=3, min_subscribers=1000):
-        # Step 1: Get target channel info and videos to extract keywords
-        channel_request = self.youtube.channels().list(
-            part="snippet,statistics,contentDetails",
-            id=self.channel_id
-        )
-        channel_response = channel_request.execute()
-
-        if not channel_response['items']:
-            return []
-
-        channel_data = channel_response['items'][0]
-        channel_title = channel_data['snippet']['title']
-        uploads_playlist = channel_data['contentDetails']['relatedPlaylists']['uploads']
-        
-        # Get some videos to extract keywords
-        videos_response = self.youtube.playlistItems().list(
-            part="snippet",
-            playlistId=uploads_playlist,
-            maxResults=10
-        ).execute()
-        
-        videos_data = [item['snippet'] for item in videos_response.get('items', [])]
-        
-        # Extract keywords from channel and videos
-        keywords = self.extract_keywords(channel_data, videos_data)
-        search_query = ' '.join(keywords) if keywords else channel_title
-        
-        print(f"🔍 Searching competitors using keywords: {search_query}")
-
-        # Step 2: Search similar channels using extracted keywords
         search_request = self.youtube.search().list(
             part="snippet",
             type="channel",
             q=search_query,
-            maxResults=max_competitors * 3  # Get more candidates, filter by metrics
+            maxResults=limit # Fetch a larger pool of candidates to calculate metrics for
         )
+        response = self._retry_execute(search_request)
 
-        response = search_request.execute()
-        competitors = []
+        if not response or not response.get('items'):
+            return []
+
+        candidate_ids = [item['snippet']['channelId'] for item in response['items'] if item['snippet']['channelId'] != self.channel_id]
         
-        for item in response['items']:
-            comp_channel_id = item['snippet']['channelId']
+        if not candidate_ids:
+            return []
 
-            # Avoid adding the same channel
-            if comp_channel_id == self.channel_id:
-                continue
-
-            # Fetch detailed metrics for filtering
-            comp_info = self._get_channel_basic(comp_channel_id)
-            if not comp_info:
+        # Step 2: Get detailed metrics for all candidates
+        profiles = []
+        for cid in candidate_ids:
+            basic = self._get_channel_basic(cid)
+            if not basic:
                 continue
             
-            # Filter by minimum subscribers to ensure relevance
-            if comp_info['subscribers'] < min_subscribers:
-                continue
-
-            comp_data = {
-                "channel_id": comp_channel_id,
-                "title": item['snippet']['title'],
-                "description": item['snippet']['description'],
-                "thumbnail": item['snippet']['thumbnails']['default']['url'],
-                "subscribers": comp_info['subscribers'],
-                "total_videos": comp_info['total_uploads'],
-                "uploads_playlist": comp_info['uploads_playlist']
-            }
+            videos = self._fetch_videos_stats(basic.get('uploads_playlist'), max_videos=20)
             
-            competitors.append(comp_data)
-            
-            if len(competitors) >= max_competitors:
-                break
+            if videos:
+                avg_views = float(sum(v['views'] for v in videos) / len(videos))
+                avg_likes = float(sum(v['likes'] for v in videos) / len(videos))
+                avg_comments = float(sum(v['comments'] for v in videos) / len(videos))
+                
+                # Brand collaborations heuristic
+                sponsor_kw = ['sponsor', 'sponsored', 'paid partnership', 'brand deal', '#ad', 'partnered']
+                bc_count = 0
+                for v in videos:
+                    txt = (v['title'] + " " + v['description']).lower()
+                    if any(k in txt for k in sponsor_kw):
+                        bc_count += 1
+            else:
+                avg_views = avg_likes = avg_comments = 0.0
+                bc_count = 0
 
-        return competitors
-# ...existing code...
+            engagement_rate = ((avg_likes + avg_comments) / avg_views * 100.0) if avg_views > 0 else 0.0
+
+            profiles.append({
+                "title": basic.get('title'),
+                "channel_id": cid,
+                "description": basic.get('description', ''),
+                "thumbnail": basic.get('thumbnail', ''),
+                "category": basic.get('category', 'General'),
+                "subscribers": int(basic.get('subscribers', 0)),
+                "engagement_rate": engagement_rate,
+                "brand_collaborations": bc_count,
+                "avg_views": avg_views,
+                "avg_likes": avg_likes
+            })
+
+        return profiles
 
     def _get_channel_basic(self, channel_id):
-        req = self.youtube.channels().list(part="snippet,statistics,contentDetails", id=channel_id)
-        res = req.execute()
-        if not res.get('items'):
+        req = self.youtube.channels().list(part="snippet,statistics,contentDetails,topicDetails", id=channel_id)
+        res = self._retry_execute(req)
+        if not res or not res.get('items'):
             return None
         it = res['items'][0]
         stats = it.get('statistics', {})
         snippet = it.get('snippet', {})
         uploads_pl = it.get('contentDetails', {}).get('relatedPlaylists', {}).get('uploads')
+        
+        # Extract category from topicDetails
+        topics = it.get('topicDetails', {}).get('topicCategories', [])
+        category = topics[0].split('/')[-1] if topics else "General"
+
+        thumbnail = snippet.get('thumbnails', {}).get('high', {}).get('url') or \
+                    snippet.get('thumbnails', {}).get('default', {}).get('url')
+        
+        if thumbnail and thumbnail.startswith('//'):
+            thumbnail = 'https:' + thumbnail
+
         return {
             'channel_id': channel_id,
             'title': snippet.get('title'),
+            'description': snippet.get('description'),
+            'thumbnail': thumbnail,
+            'category': category,
             'uploads_playlist': uploads_pl,
             'subscribers': int(stats.get('subscriberCount') or 0),
             'total_uploads': int(stats.get('videoCount') or 0)
@@ -182,12 +129,15 @@ class CompetitorDiscovery:
         vids = []
         nextPageToken = None
         while len(vids) < max_videos:
-            resp = self.youtube.playlistItems().list(
+            resp_request = self.youtube.playlistItems().list(
                 part="contentDetails,snippet",
                 playlistId=playlist_id,
                 maxResults=min(50, max_videos - len(vids)),
                 pageToken=nextPageToken
-            ).execute()
+            )
+            resp = self._retry_execute(resp_request)
+            if not resp:
+                break
             for item in resp.get('items', []):
                 vids.append(item['contentDetails']['videoId'])
             nextPageToken = resp.get('nextPageToken')
@@ -199,7 +149,10 @@ class CompetitorDiscovery:
         details = []
         for i in range(0, len(vids), 50):
             batch = vids[i:i+50]
-            vres = self.youtube.videos().list(part="statistics,snippet", id=",".join(batch)).execute()
+            vres_request = self.youtube.videos().list(part="statistics,snippet", id=",".join(batch))
+            vres = self._retry_execute(vres_request)
+            if not vres:
+                continue
             for v in vres.get('items', []):
                 s = v.get('statistics', {})
                 sn = v.get('snippet', {})
@@ -319,101 +272,4 @@ class CompetitorDiscovery:
             })
         results = sorted(results, key=lambda x: x['similarity'], reverse=True)[:top_n]
         return results
-    
-    def discover_competitors_refined(self, max_competitors=5, min_subscribers=1000, video_sample=30):
-        """
-        Refined competitor discovery with full metrics integration
-        Returns competitors with subscribers, views, engagement, etc.
-        """
-        # Step 1: Get target channel info and videos to extract keywords
-        target_basic = self._get_channel_basic(self.channel_id)
-        if not target_basic:
-            return []
-
-        # Get channel data for keyword extraction
-        channel_request = self.youtube.channels().list(
-            part="snippet,statistics,contentDetails",
-            id=self.channel_id
-        )
-        channel_response = channel_request.execute()
-        channel_data = channel_response['items'][0] if channel_response['items'] else {}
-        uploads_playlist = channel_data.get('contentDetails', {}).get('relatedPlaylists', {}).get('uploads')
-        
-        # Get videos for keyword extraction
-        videos_response = self.youtube.playlistItems().list(
-            part="snippet",
-            playlistId=uploads_playlist,
-            maxResults=10
-        ).execute() if uploads_playlist else {'items': []}
-        
-        videos_data = [item['snippet'] for item in videos_response.get('items', [])]
-        
-        # Extract keywords
-        keywords = self.extract_keywords(channel_data, videos_data)
-        search_query = ' '.join(keywords) if keywords else target_basic.get('title', '')
-        
-        print(f"🔍 Searching refined competitors using keywords: {search_query}")
-
-        # Step 2: Search similar channels by keywords
-        search_resp = self.youtube.search().list(
-            part="snippet",
-            type="channel",
-            q=search_query,
-            maxResults=max_competitors * 4  # Get more candidates
-        ).execute()
-        
-        candidate_channel_ids = [
-            it['snippet']['channelId'] for it in search_resp.get('items', [])
-            if it['snippet'].get('channelId') and it['snippet']['channelId'] != self.channel_id
-        ]
-
-        # Step 3: Fetch metrics for each candidate and filter
-        competitors_with_metrics = []
-        for cid in candidate_channel_ids:
-            basic = self._get_channel_basic(cid)
-            if not basic:
-                continue
-            
-            # Filter by minimum subscribers
-            if basic['subscribers'] < min_subscribers:
-                continue
-            
-            # Fetch video statistics
-            videos = self._fetch_videos_stats(basic.get('uploads_playlist'), max_videos=video_sample)
-            
-            if videos:
-                avg_views = float(sum(v['views'] for v in videos) / len(videos))
-                avg_likes = float(sum(v['likes'] for v in videos) / len(videos))
-                avg_comments = float(sum(v['comments'] for v in videos) / len(videos))
-                engagement_rate = ((avg_likes + avg_comments) / avg_views * 100) if avg_views > 0 else 0
-            else:
-                avg_views = avg_likes = avg_comments = 0.0
-                engagement_rate = 0.0
-
-            competitor_profile = {
-                'channel_id': cid,
-                'channel_name': basic.get('title'),
-                'title': basic.get('title'),
-                'subscribers': int(basic.get('subscribers', 0)),
-                'avg_views': int(avg_views),
-                'avg_likes': int(avg_likes),
-                'avg_comments': int(avg_comments),
-                'engagement_rate_pct': round(engagement_rate, 2),
-                'total_uploads': int(basic.get('total_uploads', 0)),
-                'videos': videos
-            }
-            
-            competitors_with_metrics.append(competitor_profile)
-            
-            if len(competitors_with_metrics) >= max_competitors:
-                break
-
-        # Sort by subscribers and views
-        competitors_with_metrics = sorted(
-            competitors_with_metrics,
-            key=lambda x: (x['subscribers'], x['avg_views']),
-            reverse=True
-        )
-
-        return competitors_with_metrics
 # ...existing code...
